@@ -58,18 +58,18 @@ async def verify_and_rate_limit(request: Request):
     
     key = api_key.split(" ")[1]
     
-    # Rate limit check (Fixed window, 5 requests per minute)
     redis_key = f"rate_limit:{key}"
     
     try:
-        current_count = await redis_client.incr(redis_key)
-        if current_count == 1:
-            await redis_client.expire(redis_key, 60)
+        pipeline = redis_client.pipeline()
+        pipeline.incr(redis_key)
+        pipeline.expire(redis_key, 60, nx=True)
+        results = await pipeline.execute()
+        current_count = results[0]
             
         if current_count > 5:
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
     except redis.ConnectionError:
-        # Fallback or error handling if Redis is down
         raise HTTPException(status_code=500, detail="Internal Server Error: Redis connection failed")
     
     return {"tenant_id": "tenant_123", "tier": "premium"}
@@ -172,9 +172,6 @@ async def chat_completions(
     request: Request, 
     tenant: dict = Depends(verify_and_rate_limit)
 ):
-    """
-    The 'Toll Gate' endpoint with fallback routing and metrics.
-    """
     try:
         body = await request.json()
         messages = body.get("messages", [])
