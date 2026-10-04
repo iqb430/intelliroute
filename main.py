@@ -36,13 +36,21 @@ tokens_streamed_total = Counter(
 )
 
 redis_client = None
+http_client = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client
+    global redis_client, http_client
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
     redis_client = redis.from_url(redis_url, decode_responses=True)
+    
+    # Initialize global Connection Pool to prevent TCP Socket Exhaustion
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=200, max_connections=1000),
+        timeout=httpx.Timeout(15.0, connect=3.0)
+    )
     yield
+    await http_client.aclose()
     await redis_client.close()
 
 app = FastAPI(title="OmniRoute Gateway - Streaming Toll Gate", lifespan=lifespan)
@@ -102,28 +110,30 @@ async def try_stream(url: str, model: str, prompt: str, tenant_id: str):
         "prompt": prompt,
         "stream": True
     }
-    async with httpx.AsyncClient() as client:
-        request = client.build_request("POST", url, json=payload)
-        response = await client.send(request, stream=True, timeout=3.0)
-        response.raise_for_status()
-        
-        async for line in response.aiter_lines():
-            if line:
-                try:
-                    data = json.loads(line)
-                    content = data.get("response", "")
-                    is_done = data.get("done", False)
+    # Using the global Connection Pool
+    request = http_client.build_request("POST", url, json=payload)
+    response = await http_client.send(request, stream=True)
+    response.raise_for_status()
+    
+    async for line in response.aiter_lines():
+        if line:
+            try:
+                data = json.loads(line)
+                content = data.get("response", "")
+                is_done = data.get("done", False)
+                
+                tokens_streamed_total.labels(tenant=tenant_id, model=model).inc()
                     
-                    tokens_streamed_total.labels(tenant=tenant_id, model=model).inc()
-                        
-                    chunk = {
-                        "id": f"chatcmpl-{int(time.time())}",
-                        "object": "chat.completion.chunk",
-                        "choices": [{"delta": {"content": content}, "index": 0, "finish_reason": "stop" if is_done else None}]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                except json.JSONDecodeError:
-                    continue
+                chunk = {
+                    "id": f"chatcmpl-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"delta": {"content": content}, "index": 0, "finish_reason": "stop" if is_done else None}]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+            except json.JSONDecodeError as decode_err:
+                # Anti-slop: Never swallow streaming fragmentation silently.
+                logger.warning(f"[STREAM PACKET DROP] Tenant {tenant_id} lost incomplete chunk: '{line}' | Err: {decode_err}")
+                continue
 
 async def stream_with_fallback(prompt: str, original_model: str, tenant_id: str):
     primary_url = "http://localhost:11434/api/generate"
